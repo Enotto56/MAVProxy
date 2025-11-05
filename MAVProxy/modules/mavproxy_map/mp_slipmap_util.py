@@ -616,7 +616,14 @@ class SlipPosition:
     '''an position object to move an existing object on the map'''
     def __init__(self, key, latlon, layer='', rotation=0, label=None, colour=None):
         self.key = key
-        self.layer = str(layer)
+        if isinstance(layer, list):
+            self.layer = list(layer)
+        elif isinstance(layer, tuple):
+            self.layer = tuple(list(layer))
+        elif isinstance(layer, set):
+            self.layer = set(layer)
+        else:
+            self.layer = str(layer)
         self.latlon = latlon
         self.rotation = rotation
         self.label = label
