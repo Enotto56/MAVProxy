@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 from pymavlink import mavutil
 
 from MAVProxy.modules.lib import mp_module, mp_settings, mp_util, multiproc
+from MAVProxy.modules.mavproxy_map import mp_slipmap
 
 try:
     from MAVProxy.modules.lib.wx_loader import wx  # type: ignore
@@ -333,6 +334,9 @@ class CatchLeader(mp_module.MPModule):
         self.last_warning: Optional[str] = None
         self.last_range_status = 0.0
         self.current_status: Optional[str] = None
+        self._map_target_key = "CatchLeaderTarget"
+        self._map_target_added = False
+        self._map_icon_image = None
 
         self.ui = self._create_ui()
         self._emit_vehicle_options()
@@ -368,6 +372,7 @@ class CatchLeader(mp_module.MPModule):
             self.manual_target = None
             self.ui.post_update("target", "Target: ---")
             self.ui.post_update("log", "Manual target cleared")
+            self._clear_map_target()
         else:
             self._print_usage()
 
@@ -396,6 +401,7 @@ class CatchLeader(mp_module.MPModule):
         self.ui.post_update("log", f"Guidance state changed to {state.upper()}")
         if state == "hold":
             self._set_system_status("Guidance paused by operator")
+            self._clear_map_target()
         else:
             self._set_system_status("Awaiting intercept solution")
 
@@ -466,6 +472,7 @@ class CatchLeader(mp_module.MPModule):
         else:
             intercept = self.compute_intercept(now)
             if intercept is None:
+                self._clear_map_target()
                 return
             target, closing_time = intercept
 
@@ -480,6 +487,7 @@ class CatchLeader(mp_module.MPModule):
             if (self.follower.lat is not None and self.follower.lon is not None):
                 rng = mp_util.gps_distance(self.follower.lat, self.follower.lon, target[0], target[1])
                 self.ui.post_update("range", f"Range to manual: {rng:6.1f} m")
+            self._update_map_target(target, None, manual=True)
         else:
             rng = mp_util.gps_distance(self.follower.lat, self.follower.lon,
                                        self.leader.lat, self.leader.lon)
@@ -488,6 +496,7 @@ class CatchLeader(mp_module.MPModule):
                 "target",
                 f"Target: predicted {target[0]:.6f} {target[1]:.6f} alt {target[2]:.1f}m",
             )
+            self._update_map_target(target, closing_time, manual=False)
 
     def _process_ui_commands(self) -> None:
         for name, payload in self.ui.poll_commands():
@@ -502,6 +511,7 @@ class CatchLeader(mp_module.MPModule):
                 self.manual_target = None
                 self.ui.post_update("target", "Target: ---")
                 self._set_system_status("Awaiting intercept solution")
+                self._clear_map_target()
             elif payload == "fbwa":
                 self.set_follower_fbwa()
             elif payload and payload.startswith("select_leader:"):
@@ -741,7 +751,77 @@ class CatchLeader(mp_module.MPModule):
 
     def unload(self) -> None:
         super().unload()
+        self._clear_map_target()
         self.ui.close()
+
+    def _map_instance(self):
+        return getattr(self.mpstate, "map", None)
+
+    def _ensure_map_icon(self):
+        if self._map_icon_image is False:
+            return None
+        if self._map_icon_image is not None:
+            return self._map_icon_image
+        mpmap = self._map_instance()
+        if not mpmap:
+            return None
+        try:
+            self._map_icon_image = mpmap.icon("flag.png")
+        except Exception:
+            self._map_icon_image = False
+            return None
+        return self._map_icon_image
+
+    def _update_map_target(self, target: Tuple[float, float, float], closing_time: Optional[float], manual: bool) -> None:
+        mpmap = self._map_instance()
+        if not mpmap:
+            return
+        icon = self._ensure_map_icon()
+        if icon is None:
+            return
+        lat, lon, alt = target
+        label_parts = ["CatchLeader target"]
+        if manual:
+            label_parts.append("manual")
+        else:
+            label_parts.append("predictive")
+        if closing_time is not None:
+            label_parts.append(f"ETA {closing_time:0.1f}s")
+        label_parts.append(f"alt {alt:.1f}m")
+        label = " | ".join(label_parts)
+        colour = (255, 255, 0) if manual else (255, 128, 0)
+        latlon = (lat, lon)
+        if not self._map_target_added:
+            mpmap.add_object(
+                mp_slipmap.SlipIcon(
+                    self._map_target_key,
+                    latlon,
+                    icon,
+                    layer="CatchLeader",
+                    follow=False,
+                    label=label,
+                    colour=colour,
+                )
+            )
+            self._map_target_added = True
+        else:
+            mpmap.set_position(
+                self._map_target_key,
+                latlon,
+                layer="CatchLeader",
+                label=label,
+                colour=colour,
+            )
+
+    def _clear_map_target(self) -> None:
+        if not self._map_target_added:
+            return
+        mpmap = self._map_instance()
+        if not mpmap:
+            self._map_target_added = False
+            return
+        mpmap.add_object(mp_slipmap.SlipRemoveObject(self._map_target_key))
+        self._map_target_added = False
 
 
 def init(mpstate):
