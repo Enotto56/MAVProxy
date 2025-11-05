@@ -780,7 +780,7 @@ class CatchLeader(mp_module.MPModule):
         if icon is None:
             return
         lat, lon, alt = target
-        label_parts = ["CatchLeader target"]
+        label_parts = ["target"]
         if manual:
             label_parts.append("manual")
         else:
