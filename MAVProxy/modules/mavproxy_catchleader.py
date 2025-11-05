@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Catch-the-leader control module with predictive intercept guidance."""
 
+import inspect
 import math
 import time
 from dataclasses import dataclass
@@ -10,6 +11,29 @@ from pymavlink import mavutil
 
 from MAVProxy.modules.lib import mp_module, mp_settings, mp_util, multiproc
 from MAVProxy.modules.mavproxy_map import mp_slipmap
+
+
+def _supports_keyword(func, keyword: str) -> bool:
+    """Return True if *func* accepts *keyword* as a keyword argument."""
+
+    if func is None:
+        return False
+    try:
+        signature = inspect.signature(func)
+    except (TypeError, ValueError):
+        return False
+    for param in signature.parameters.values():
+        if param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return keyword in signature.parameters
+
+
+_SLIPICON_SUPPORTS_LABEL_SCALE = _supports_keyword(
+    getattr(mp_slipmap.SlipIcon, "__init__", None), "label_scale")
+_SLIPPOSITION_SUPPORTS_LABEL_SCALE = _supports_keyword(
+    getattr(mp_slipmap.SlipPosition, "__init__", None), "label_scale")
+_MPSLIPMAP_SET_POSITION_SUPPORTS_LABEL_SCALE = _supports_keyword(
+    getattr(mp_slipmap.MPSlipMap, "set_position", None), "label_scale")
 
 try:
     from MAVProxy.modules.lib.wx_loader import wx  # type: ignore
@@ -792,30 +816,63 @@ class CatchLeader(mp_module.MPModule):
         label = "\n".join(label_lines)
         colour = (255, 255, 0) if manual else (255, 128, 0)
         latlon = (lat, lon)
+        label_scale = 0.5
         if not self._map_target_added:
-            mpmap.add_object(
-                mp_slipmap.SlipIcon(
-                    self._map_target_key,
-                    latlon,
-                    icon,
-                    layer="CatchLeader",
-                    follow=False,
-                    label=label,
-                    colour=colour,
-                    label_scale=0.5,
-                )
+            icon_kwargs = {
+                "layer": "CatchLeader",
+                "follow": False,
+                "label": label,
+                "colour": colour,
+            }
+            if _SLIPICON_SUPPORTS_LABEL_SCALE:
+                icon_kwargs["label_scale"] = label_scale
+            icon_obj = mp_slipmap.SlipIcon(
+                self._map_target_key,
+                latlon,
+                icon,
+                **icon_kwargs,
             )
+            if not _SLIPICON_SUPPORTS_LABEL_SCALE:
+                setattr(icon_obj, "label_scale", label_scale)
+            mpmap.add_object(icon_obj)
             self._map_target_added = True
         else:
+            position_kwargs = {
+                # layer must be iterable; wrap string so UI doesn't iterate characters
+                "layer": ["CatchLeader"],
+                "label": label,
+                "colour": colour,
+            }
+            label_scale_supported = (
+                _MPSLIPMAP_SET_POSITION_SUPPORTS_LABEL_SCALE or
+                _SLIPPOSITION_SUPPORTS_LABEL_SCALE
+            )
+            if label_scale_supported:
+                position_kwargs["label_scale"] = label_scale
             mpmap.set_position(
                 self._map_target_key,
                 latlon,
-                # layer must be iterable; wrap string so UI doesn't iterate characters
-                layer=["CatchLeader"],
-                label=label,
-                colour=colour,
-                label_scale=0.5,
+                **position_kwargs,
             )
+            if not label_scale_supported:
+                try:
+                    fallback = mp_slipmap.SlipPosition(
+                        self._map_target_key,
+                        latlon,
+                        layer=position_kwargs["layer"],
+                        label=label,
+                        colour=colour,
+                    )
+                except TypeError:
+                    fallback = mp_slipmap.SlipPosition(
+                        self._map_target_key,
+                        latlon,
+                        label=label,
+                        colour=colour,
+                    )
+                setattr(fallback, "label_scale", label_scale)
+                if hasattr(mpmap, "object_queue"):
+                    mpmap.object_queue.put(fallback)
 
     def _clear_map_target(self) -> None:
         if not self._map_target_added:
