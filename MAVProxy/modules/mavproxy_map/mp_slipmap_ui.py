@@ -267,8 +267,6 @@ class MPSlipMapFrame(wx.Frame):
                         object.label = obj.label
                     if obj.colour is not None:
                         object.colour = obj.colour
-                    if getattr(obj, 'label_scale', None) is not None:
-                        object.label_scale = obj.label_scale
                     state.need_redraw = True
 
             if isinstance(obj, SlipDefaultPopup):

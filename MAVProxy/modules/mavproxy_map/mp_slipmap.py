@@ -140,11 +140,9 @@ class MPSlipMap():
         '''hide an object on the map by key'''
         self.object_queue.put(SlipHideObject(key, hide))
 
-    def set_position(self, key, latlon, layer='', rotation=0, label=None, colour=None,
-                    label_scale=None):
+    def set_position(self, key, latlon, layer='', rotation=0, label=None, colour=None):
         '''move an object on the map'''
-        self.object_queue.put(SlipPosition(key, latlon, layer, rotation, label, colour,
-                                           label_scale=label_scale))
+        self.object_queue.put(SlipPosition(key, latlon, layer, rotation, label, colour))
 
     def event_queue_empty(self):
         '''return True if there are no events waiting to be processed'''
