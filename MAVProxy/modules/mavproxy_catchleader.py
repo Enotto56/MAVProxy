@@ -808,6 +808,8 @@ class CatchLeader(mp_module.MPModule):
             mpmap.set_position(
                 self._map_target_key,
                 latlon,
+                # layer must be iterable; wrap string so UI doesn't iterate characters
+                layer=["CatchLeader"],
                 label=label,
                 colour=colour,
             )
