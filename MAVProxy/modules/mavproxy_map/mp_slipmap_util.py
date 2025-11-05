@@ -68,8 +68,6 @@ class SlipObject:
         self.latlon = newpos.latlon
         if hasattr(self, 'rotation'):
             self.rotation = newpos.rotation
-        if hasattr(newpos, 'label_scale') and newpos.label_scale is not None:
-            setattr(self, 'label_scale', newpos.label_scale)
 
     def clicked(self, px, py):
         '''check if a click on px,py should be considered a click
@@ -565,15 +563,13 @@ class SlipTrail:
 class SlipIcon(SlipThumbnail):
     '''a icon to display on the map'''
     def __init__(self, key, latlon, img, layer=1, rotation=0,
-                 follow=False, trail=None, popup_menu=None, label=None,
-                 colour=(255, 255, 255), label_scale=1.0):
+                 follow=False, trail=None, popup_menu=None, label=None, colour=(255, 255, 255)):
         SlipThumbnail.__init__(self, key, latlon, layer, img, popup_menu=popup_menu)
         self.rotation = rotation
         self.follow = follow
         self.trail = trail
         self.label = label
         self.colour = colour # label colour
-        self.label_scale = label_scale
 
     def img(self):
         '''return a cv image for the icon'''
@@ -609,16 +605,7 @@ class SlipIcon(SlipThumbnail):
         img[py:py + h, px:px + w] = cv2.add(img[py:py+h, px:px+w], icon[sy:sy+h, sx:sx+w])
 
         if self.label is not None:
-            label_text = str(self.label)
-            scale = getattr(self, 'label_scale', 1.0)
-            thickness = max(1, int(round(scale))) if scale > 0 else 1
-            y_offset = py
-            for line in label_text.splitlines() or ['']:
-                text_line = line if line else ' '
-                cv2.putText(img, text_line, (px, y_offset), font, scale,
-                            self.colour, thickness, cv2.LINE_AA)
-                (text_size, baseline) = cv2.getTextSize(text_line, font, scale, thickness)
-                y_offset += text_size[1] + baseline
+            cv2.putText(img, self.label, (px, py), font, 1.0, self.colour)
 
         # remember where we placed it for clicked()
         self.posx = px+w//2
@@ -627,8 +614,7 @@ class SlipIcon(SlipThumbnail):
 
 class SlipPosition:
     '''an position object to move an existing object on the map'''
-    def __init__(self, key, latlon, layer='', rotation=0, label=None, colour=None,
-                 label_scale=None):
+    def __init__(self, key, latlon, layer='', rotation=0, label=None, colour=None):
         self.key = key
         if isinstance(layer, list):
             self.layer = list(layer)
@@ -642,7 +628,6 @@ class SlipPosition:
         self.rotation = rotation
         self.label = label
         self.colour = colour
-        self.label_scale = label_scale
 
 
 class SlipClickLocation(SlipObject):
