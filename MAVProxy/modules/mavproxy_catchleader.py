@@ -780,15 +780,16 @@ class CatchLeader(mp_module.MPModule):
         if icon is None:
             return
         lat, lon, alt = target
-        label_parts = ["CatchLeader target"]
         if manual:
-            label_parts.append("manual")
+            mode_label = "manual"
         else:
-            label_parts.append("predictive")
+            mode_label = "predictive"
         if closing_time is not None:
-            label_parts.append(f"ETA {closing_time:0.1f}s")
-        label_parts.append(f"alt {alt:.1f}m")
-        label = " | ".join(label_parts)
+            eta_label = f"ETA {closing_time:0.1f}S"
+        else:
+            eta_label = "ETA ---"
+        label_lines = [mode_label, eta_label, f"alt {alt:.1f}m"]
+        label = "\n".join(label_lines)
         colour = (255, 255, 0) if manual else (255, 128, 0)
         latlon = (lat, lon)
         if not self._map_target_added:
@@ -801,6 +802,7 @@ class CatchLeader(mp_module.MPModule):
                     follow=False,
                     label=label,
                     colour=colour,
+                    label_scale=0.5,
                 )
             )
             self._map_target_added = True
@@ -812,6 +814,7 @@ class CatchLeader(mp_module.MPModule):
                 layer=["CatchLeader"],
                 label=label,
                 colour=colour,
+                label_scale=0.5,
             )
 
     def _clear_map_target(self) -> None:
