@@ -175,6 +175,8 @@ class MPSlipMapFrame(wx.Frame):
 
         if layers is None or layers == '':
             layers = state.layers.keys()
+        elif isinstance(layers, str):
+            layers = [layers]
         for layer in layers:
             if key in state.layers[layer]:
                 return state.layers[layer][key]
