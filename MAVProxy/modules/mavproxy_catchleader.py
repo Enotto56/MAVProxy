@@ -683,7 +683,8 @@ class CatchLeader(mp_module.MPModule):
         )
 
     def _emit_vehicle_update(self, state: VehicleState) -> None:
-        label = self._format_vehicle(state)
+        now = self.get_time()
+        label = self._format_vehicle(state, now)
         if state is self.leader:
             self.ui.post_update("leader", label)
             self.ui.post_update("leader_selection", state.identifier())
@@ -691,7 +692,6 @@ class CatchLeader(mp_module.MPModule):
             self.ui.post_update("follower", label)
             self.ui.post_update("follower_selection", state.identifier())
         if state is self.follower and self.manual_target is None:
-            now = self.get_time()
             if (now - self.last_range_status > 1.0
                     and self.leader.lat is not None and self.leader.lon is not None
                     and self.follower.lat is not None and self.follower.lon is not None):
@@ -701,15 +701,16 @@ class CatchLeader(mp_module.MPModule):
                 self.last_range_status = now
 
     def _emit_status(self) -> None:
-        self.ui.post_update("leader", self._format_vehicle(self.leader))
+        now = self.get_time()
+        self.ui.post_update("leader", self._format_vehicle(self.leader, now))
         self.ui.post_update("leader_selection", self.leader.identifier())
-        self.ui.post_update("follower", self._format_vehicle(self.follower))
+        self.ui.post_update("follower", self._format_vehicle(self.follower, now))
         self.ui.post_update("follower_selection", self.follower.identifier())
         self.ui.post_update("status", "Guidance: HOLD")
         self.ui.post_update("warning", "Warnings: none")
         self._set_system_status("Awaiting intercept solution")
 
-    def _format_vehicle(self, state: VehicleState) -> str:
+    def _format_vehicle(self, state: VehicleState, now: Optional[float] = None) -> str:
         latlon = "---"
         if state.lat is not None and state.lon is not None:
             latlon = f"{state.lat:.6f} {state.lon:.6f}"
@@ -720,16 +721,23 @@ class CatchLeader(mp_module.MPModule):
         speed_str = f"{speed:.1f}m/s" if speed is not None else "---"
         mode = state.mode
         armed = "ARMED" if state.armed else "DISARMED"
+        pos_age = None
+        hb_age = None
+        if now is not None:
+            if state.last_update > 0.0:
+                pos_age = max(0.0, now - state.last_update)
+            if state.last_heartbeat > 0.0:
+                hb_age = max(0.0, now - state.last_heartbeat)
+        pos_str = f"{pos_age:.1f}s" if pos_age is not None else "---"
+        hb_str = f"{hb_age:.1f}s" if hb_age is not None else "---"
         return (f"Sys {state.sysid}:{state.compid} | {latlon} | alt {alt} | "
-                f"spd {speed_str} | {mode} | {armed}")
+                f"spd {speed_str} | {mode} | {armed} | pos {pos_str} / hb {hb_str}")
 
     def status_report(self) -> str:
         now = self.get_time()
-        leader_age = now - self.leader.last_update if self.leader.last_update else float("inf")
-        follower_age = now - self.follower.last_update if self.follower.last_update else float("inf")
         parts = [
-            f"Leader: {self._format_vehicle(self.leader)} (age {leader_age:.1f}s)",
-            f"Follower: {self._format_vehicle(self.follower)} (age {follower_age:.1f}s)",
+            f"Leader: {self._format_vehicle(self.leader, now)}",
+            f"Follower: {self._format_vehicle(self.follower, now)}",
             f"Guidance state: {self.guidance_state.upper()}",
         ]
         if self.manual_target is not None:
