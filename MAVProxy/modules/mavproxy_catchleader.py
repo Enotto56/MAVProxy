@@ -352,6 +352,9 @@ class CatchLeader(mp_module.MPModule):
         self._map_target_key = "CatchLeaderTarget"
         self._map_target_added = False
         self._map_icon_image = None
+        self._last_vehicle_refresh = 0.0
+        self._last_leader_label: Optional[str] = None
+        self._last_follower_label: Optional[str] = None
 
         self.ui = self._create_ui()
         self._emit_vehicle_options()
@@ -472,6 +475,9 @@ class CatchLeader(mp_module.MPModule):
         self._process_ui_commands()
         now = self.get_time()
         self._update_warnings(now)
+        if now - self._last_vehicle_refresh >= 0.75:
+            self._refresh_vehicle_labels(now)
+            self._last_vehicle_refresh = now
 
         if self.guidance_state != "auto":
             if self.manual_target is None:
@@ -682,30 +688,45 @@ class CatchLeader(mp_module.MPModule):
             f"Sent intercept target {lat:.6f} {lon:.6f} alt {alt:.1f}m",
         )
 
-    def _emit_vehicle_update(self, state: VehicleState) -> None:
-        now = self.get_time()
-        label = self._format_vehicle(state, now)
-        if state is self.leader:
-            self.ui.post_update("leader", label)
-            self.ui.post_update("leader_selection", state.identifier())
-        elif state is self.follower:
-            self.ui.post_update("follower", label)
-            self.ui.post_update("follower_selection", state.identifier())
-        if state is self.follower and self.manual_target is None:
-            if (now - self.last_range_status > 1.0
+    def _refresh_vehicle_labels(self, now: float, update_selection: bool = False) -> None:
+        leader_label = self._format_vehicle(self.leader, now)
+        if leader_label != self._last_leader_label:
+            self.ui.post_update("leader", leader_label)
+            self._last_leader_label = leader_label
+
+        follower_label = self._format_vehicle(self.follower, now)
+        if follower_label != self._last_follower_label:
+            self.ui.post_update("follower", follower_label)
+            self._last_follower_label = follower_label
+
+        if update_selection:
+            self.ui.post_update("leader_selection", self.leader.identifier())
+            self.ui.post_update("follower_selection", self.follower.identifier())
+            if (self.manual_target is None
                     and self.leader.lat is not None and self.leader.lon is not None
-                    and self.follower.lat is not None and self.follower.lon is not None):
-                rng = mp_util.gps_distance(self.follower.lat, self.follower.lon,
-                                           self.leader.lat, self.leader.lon)
+                    and self.follower.lat is not None and self.follower.lon is not None
+                    and (now - self.last_range_status > 1.0 or self.last_range_status == 0.0)):
+                rng = mp_util.gps_distance(
+                    self.follower.lat,
+                    self.follower.lon,
+                    self.leader.lat,
+                    self.leader.lon,
+                )
                 self.ui.post_update("range", f"Range: {rng:6.1f} m  Δt: ---")
                 self.last_range_status = now
 
+    def _emit_vehicle_update(self, state: VehicleState) -> None:
+        now = self.get_time()
+        self._refresh_vehicle_labels(now, update_selection=True)
+        self._last_vehicle_refresh = now
+
     def _emit_status(self) -> None:
         now = self.get_time()
-        self.ui.post_update("leader", self._format_vehicle(self.leader, now))
-        self.ui.post_update("leader_selection", self.leader.identifier())
-        self.ui.post_update("follower", self._format_vehicle(self.follower, now))
-        self.ui.post_update("follower_selection", self.follower.identifier())
+        self._last_vehicle_refresh = 0.0
+        self._last_leader_label = None
+        self._last_follower_label = None
+        self._refresh_vehicle_labels(now, update_selection=True)
+        self._last_vehicle_refresh = now
         self.ui.post_update("status", "Guidance: HOLD")
         self.ui.post_update("warning", "Warnings: none")
         self._set_system_status("Awaiting intercept solution")
