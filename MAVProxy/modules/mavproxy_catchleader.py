@@ -161,6 +161,7 @@ if wx is not None:
             self.status_text = wx.StaticText(panel, label="Guidance: HOLD")
             self.system_text = wx.StaticText(panel, label="System status: Initialising")
             self.warning_text = wx.StaticText(panel, label="Warnings: none")
+            self._warning_base_colour = self.warning_text.GetForegroundColour()
 
             btn_catch = wx.Button(panel, label="Catch now")
             btn_hold = wx.Button(panel, label="Hold guidance")
@@ -223,6 +224,20 @@ if wx is not None:
             timestamp = time.strftime("%H:%M:%S")
             self.log.AppendText(f"[{timestamp}] {text}\n")
 
+        def update_warning(self, text: str, log: Optional[str] = None) -> None:
+            has_warning = bool(text) and text.lower() != "warnings: none"
+            colour = self._warning_base_colour
+            if has_warning:
+                lowered = text.lower()
+                if any(word in lowered for word in ("lost", "disarmed")):
+                    colour = wx.Colour(220, 53, 69)  # red for critical warnings
+                else:
+                    colour = wx.Colour(255, 140, 0)  # orange for general warnings
+            self.warning_text.SetForegroundColour(colour)
+            self.warning_text.SetLabel(text)
+            if log:
+                self.append_log(log)
+
         def on_timer(self, _event) -> None:
             try:
                 while self.ui_state.child_pipe.poll():
@@ -240,7 +255,7 @@ if wx is not None:
                     elif name == "system" and payload is not None:
                         self.system_text.SetLabel(payload)
                     elif name == "warning" and payload is not None:
-                        self.warning_text.SetLabel(payload)
+                        self.update_warning(payload)
                     elif name == "log" and payload is not None:
                         self.append_log(payload)
                     elif name == "vehicles" and isinstance(payload, list):
@@ -556,6 +571,11 @@ class CatchLeader(mp_module.MPModule):
         text = "; ".join(warnings) if warnings else "Warnings: none"
         if text != self.last_warning:
             self.ui.post_update("warning", text)
+            if warnings:
+                log_text = f"Warnings updated: {text}"
+            else:
+                log_text = "Warnings cleared"
+            self.ui.post_update("log", log_text)
             self.last_warning = text
 
     def compute_intercept(self, now: float) -> Optional[Tuple[Tuple[float, float, float], float]]:
