@@ -163,6 +163,13 @@ if wx is not None:
             self.warning_text = wx.StaticText(panel, label="Warnings: none")
             self._warning_base_colour = self.warning_text.GetForegroundColour()
 
+            self.alt_mode_toggle = wx.ToggleButton(panel, label="Altitude mode: Absolute")
+            self.alt_mode_toggle.SetValue(False)
+            self.alt_mode_toggle.Bind(
+                wx.EVT_TOGGLEBUTTON,
+                self._on_alt_mode_toggle,
+            )
+
             btn_catch = wx.Button(panel, label="Catch now")
             btn_hold = wx.Button(panel, label="Hold guidance")
             btn_resume = wx.Button(panel, label="Resume auto")
@@ -197,6 +204,8 @@ if wx is not None:
                            self.warning_text):
                 main_sizer.Add(widget, flag=wx.ALL | wx.EXPAND, border=4)
 
+            main_sizer.Add(self.alt_mode_toggle, flag=wx.ALL | wx.ALIGN_CENTER_HORIZONTAL, border=4)
+
             button_sizer = wx.BoxSizer(wx.HORIZONTAL)
             for button in (btn_catch, btn_hold, btn_resume, btn_clear, btn_fbwa):
                 button_sizer.Add(button, proportion=1, flag=wx.ALL, border=4)
@@ -210,6 +219,14 @@ if wx is not None:
             self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
             self.timer.Start(200)
             self.Bind(wx.EVT_CLOSE, self.on_close)
+
+        def _on_alt_mode_toggle(self, _event) -> None:
+            mode = "relative" if self.alt_mode_toggle.GetValue() else "absolute"
+            self.alt_mode_toggle.SetLabel(f"Altitude mode: {'Relative' if mode == 'relative' else 'Absolute'}")
+            try:
+                self.ui_state.child_pipe.send(("command", f"alt_mode:{mode}"))
+            except (EOFError, BrokenPipeError):
+                pass
 
         def _emit_selection(self, kind: str, choice: "wx.Choice") -> None:
             selection = choice.GetStringSelection()
@@ -264,6 +281,8 @@ if wx is not None:
                         self._set_choice_selection(self.leader_choice, payload)
                     elif name == "follower_selection" and payload is not None:
                         self._set_choice_selection(self.follower_choice, payload)
+                    elif name == "alt_mode" and payload in ("relative", "absolute"):
+                        self._update_alt_mode_toggle(payload)
                     elif name == "shutdown":
                         self.Destroy()
                         return
@@ -288,6 +307,12 @@ if wx is not None:
             idx = choice.FindString(value)
             if idx != wx.NOT_FOUND:
                 choice.SetSelection(idx)
+
+        def _update_alt_mode_toggle(self, mode: str) -> None:
+            is_relative = mode == "relative"
+            self.alt_mode_toggle.SetValue(is_relative)
+            label = "Altitude mode: Relative" if is_relative else "Altitude mode: Absolute"
+            self.alt_mode_toggle.SetLabel(label)
 
         def on_close(self, event) -> None:
             try:
@@ -315,7 +340,7 @@ class CatchLeader(mp_module.MPModule):
             ("min_distance", float, 5.0),
             ("position_timeout", float, 3.0),
             ("heartbeat_timeout", float, 4.5),
-            ("use_relative_alt", bool, True),
+            ("use_relative_alt", bool, False),
         ])
         self.add_command(
             "catchleader",
@@ -324,6 +349,7 @@ class CatchLeader(mp_module.MPModule):
             [
                 "status",
                 "set (CATCHSETTING)",
+                "alt_mode:<relative|absolute>",
                 "catch",
                 "hold",
                 "resume",
@@ -355,10 +381,12 @@ class CatchLeader(mp_module.MPModule):
         self._last_vehicle_refresh = 0.0
         self._last_leader_label: Optional[str] = None
         self._last_follower_label: Optional[str] = None
+        self._last_target_info: Optional[Tuple[Tuple[float, float, float], bool, Optional[float]]] = None
 
         self.ui = self._create_ui()
         self._emit_vehicle_options()
         self._emit_status()
+        self._emit_altitude_mode(initial=True)
 
     def _create_ui(self):
         if wx is None:
@@ -368,6 +396,35 @@ class CatchLeader(mp_module.MPModule):
         except Exception:
             return NullCatchLeaderUI()
 
+    def _altitude_frame_suffix(self) -> str:
+        return "AGL" if self.catch_settings.use_relative_alt else "AMSL"
+
+    def _format_altitude_text(self, alt: float) -> str:
+        return f"alt {alt:.1f}m {self._altitude_frame_suffix()}"
+
+    def _format_target_label(self, target: Tuple[float, float, float], manual: bool) -> str:
+        lat, lon, alt = target
+        mode = "manual" if manual else "predicted"
+        return f"Target: {mode} {lat:.6f} {lon:.6f} {self._format_altitude_text(alt)}"
+
+    def _refresh_target_display(self) -> None:
+        if not self._last_target_info:
+            return
+        target, manual, closing_time = self._last_target_info
+        self.ui.post_update("target", self._format_target_label(target, manual))
+        self._update_map_target(target, closing_time, manual)
+
+    def _emit_altitude_mode(self, initial: bool = False) -> None:
+        mode = "relative" if self.catch_settings.use_relative_alt else "absolute"
+        self.ui.post_update("alt_mode", mode)
+        now = self.get_time()
+        self._last_leader_label = None
+        self._last_follower_label = None
+        self._refresh_vehicle_labels(now, update_selection=False)
+        self._last_vehicle_refresh = now
+        if not initial:
+            self._refresh_target_display()
+
     def cmd_catchleader(self, args: List[str]) -> None:
         if not args:
             self._print_usage()
@@ -376,8 +433,11 @@ class CatchLeader(mp_module.MPModule):
         if cmd == "status":
             print(self.status_report())
         elif cmd == "set":
+            previous_mode = self.catch_settings.use_relative_alt
             self.catch_settings.command(args[1:])
             self._refresh_sysids()
+            changed = previous_mode != self.catch_settings.use_relative_alt
+            self._on_altitude_mode_updated(changed, source="CLI set")
         elif cmd in ("catch", "resume"):
             self.set_guidance_state("auto")
         elif cmd == "hold":
@@ -391,11 +451,15 @@ class CatchLeader(mp_module.MPModule):
             self.ui.post_update("target", "Target: ---")
             self.ui.post_update("log", "Manual target cleared")
             self._clear_map_target()
+            self._last_target_info = None
+            self._set_system_status("Awaiting intercept solution")
+        elif cmd.startswith("alt_mode:"):
+            self._handle_altitude_mode(cmd[len("alt_mode:"):], source="CLI command")
         else:
             self._print_usage()
 
     def _print_usage(self) -> None:
-        print("Usage: catchleader <status|set|catch|hold|resume|fbwa|goto|clear>")
+        print("Usage: catchleader <status|set|alt_mode|catch|hold|resume|fbwa|goto|clear>")
 
     def _refresh_sysids(self) -> None:
         self.leader = self._ensure_state(
@@ -439,11 +503,14 @@ class CatchLeader(mp_module.MPModule):
         except ValueError:
             print("Invalid coordinates")
             return
-        self.manual_target = (lat, lon, alt)
+        target = (lat, lon, alt)
+        self.manual_target = target
         self.set_guidance_state("auto")
-        self.ui.post_update("target", f"Target: manual {lat:.6f} {lon:.6f} alt {alt:.1f}m")
+        self.ui.post_update("target", self._format_target_label(target, True))
         self.ui.post_update("log", "Manual intercept target set")
         self._set_system_status("Guiding to manual target")
+        self._last_target_info = (target, True, None)
+        self._update_map_target(target, None, manual=True)
 
     def _ensure_state(self, sysid: int, compid: int) -> VehicleState:
         key = (sysid, compid)
@@ -488,7 +555,7 @@ class CatchLeader(mp_module.MPModule):
 
         if self.manual_target is not None:
             target = self.manual_target
-            closing_time = 0.0
+            closing_time: Optional[float] = None
             self._set_system_status("Guiding to manual target")
         else:
             intercept = self.compute_intercept(now)
@@ -501,22 +568,21 @@ class CatchLeader(mp_module.MPModule):
         self.last_sent = now
         self.ui.post_update(
             "status",
-            f"Guidance: AUTO → {target[0]:.6f} {target[1]:.6f} {target[2]:.1f}m",
+            f"Guidance: AUTO → {target[0]:.6f} {target[1]:.6f} {self._format_altitude_text(target[2])}",
         )
         if self.manual_target is not None:
-            self.ui.post_update("target", f"Target: manual {target[0]:.6f} {target[1]:.6f} {target[2]:.1f}m")
+            self.ui.post_update("target", self._format_target_label(target, True))
             if (self.follower.lat is not None and self.follower.lon is not None):
                 rng = mp_util.gps_distance(self.follower.lat, self.follower.lon, target[0], target[1])
                 self.ui.post_update("range", f"Range to manual: {rng:6.1f} m")
-            self._update_map_target(target, None, manual=True)
+            self._last_target_info = (target, True, closing_time)
+            self._update_map_target(target, closing_time, manual=True)
         else:
             rng = mp_util.gps_distance(self.follower.lat, self.follower.lon,
                                        self.leader.lat, self.leader.lon)
             self.ui.post_update("range", f"Range: {rng:6.1f} m  Δt: {closing_time:5.1f} s")
-            self.ui.post_update(
-                "target",
-                f"Target: predicted {target[0]:.6f} {target[1]:.6f} alt {target[2]:.1f}m",
-            )
+            self.ui.post_update("target", self._format_target_label(target, False))
+            self._last_target_info = (target, False, closing_time)
             self._update_map_target(target, closing_time, manual=False)
 
     def _process_ui_commands(self) -> None:
@@ -526,6 +592,8 @@ class CatchLeader(mp_module.MPModule):
             if payload == "catch" or payload == "resume":
                 self.manual_target = None
                 self.set_guidance_state("auto")
+                self._last_target_info = None
+                self._clear_map_target()
             elif payload == "hold":
                 self.set_guidance_state("hold")
             elif payload == "clear":
@@ -533,12 +601,15 @@ class CatchLeader(mp_module.MPModule):
                 self.ui.post_update("target", "Target: ---")
                 self._set_system_status("Awaiting intercept solution")
                 self._clear_map_target()
+                self._last_target_info = None
             elif payload == "fbwa":
                 self.set_follower_fbwa()
             elif payload and payload.startswith("select_leader:"):
                 self._handle_ui_selection(payload[len("select_leader:"):], leader=True)
             elif payload and payload.startswith("select_follower:"):
                 self._handle_ui_selection(payload[len("select_follower:"):], leader=False)
+            elif payload and payload.startswith("alt_mode:"):
+                self._handle_altitude_mode(payload[len("alt_mode:"):], source="UI")
             elif payload == "ui_closed":
                 self.ui.close()
                 self.ui = NullCatchLeaderUI()
@@ -559,6 +630,31 @@ class CatchLeader(mp_module.MPModule):
         self._refresh_sysids()
         who = "Leader" if leader else "Follower"
         self.ui.post_update("log", f"{who} set to {sysid}:{compid}")
+
+    def _handle_altitude_mode(self, mode: str, source: str = "command") -> None:
+        desired = mode.strip().lower()
+        if desired not in ("relative", "absolute"):
+            return
+        use_relative = desired == "relative"
+        current = self.catch_settings.use_relative_alt
+        if use_relative == current:
+            self._on_altitude_mode_updated(False, source=source)
+            return
+        self.catch_settings.set("use_relative_alt", use_relative)
+        self._on_altitude_mode_updated(True, source=source)
+
+    def _on_altitude_mode_updated(self, changed: bool, source: str) -> None:
+        if changed and self.manual_target is not None:
+            self.manual_target = None
+            self._last_target_info = None
+            self.ui.post_update("target", "Target: ---")
+            self.ui.post_update("log", "Manual target cleared due to altitude mode change")
+            self._set_system_status("Awaiting intercept solution")
+            self._clear_map_target()
+        if changed:
+            mode = "RELATIVE" if self.catch_settings.use_relative_alt else "ABSOLUTE"
+            self.ui.post_update("log", f"Altitude mode set to {mode} ({source})")
+        self._emit_altitude_mode()
 
     def _update_warnings(self, now: float) -> None:
         warnings: List[str] = []
@@ -685,7 +781,7 @@ class CatchLeader(mp_module.MPModule):
         )
         self.ui.post_update(
             "log",
-            f"Sent intercept target {lat:.6f} {lon:.6f} alt {alt:.1f}m",
+            f"Sent intercept target {lat:.6f} {lon:.6f} {self._format_altitude_text(alt)}",
         )
 
     def _refresh_vehicle_labels(self, now: float, update_selection: bool = False) -> None:
@@ -735,9 +831,15 @@ class CatchLeader(mp_module.MPModule):
         latlon = "---"
         if state.lat is not None and state.lon is not None:
             latlon = f"{state.lat:.6f} {state.lon:.6f}"
-        alt = "---"
-        if state.rel_alt is not None:
-            alt = f"{state.rel_alt:.1f}m"
+        if self.catch_settings.use_relative_alt:
+            alt_value = state.rel_alt
+        else:
+            alt_value = state.amsl_alt
+        suffix = self._altitude_frame_suffix()
+        if alt_value is not None:
+            alt = f"{alt_value:.1f}m {suffix}"
+        else:
+            alt = f"--- {suffix}"
         speed = state.speed()
         speed_str = f"{speed:.1f}m/s" if speed is not None else "---"
         mode = state.mode
@@ -762,8 +864,9 @@ class CatchLeader(mp_module.MPModule):
             f"Guidance state: {self.guidance_state.upper()}",
         ]
         if self.manual_target is not None:
+            lat, lon, alt = self.manual_target
             parts.append(
-                "Manual target: lat {0:.6f} lon {1:.6f} alt {2:.1f}m".format(*self.manual_target)
+                f"Manual target: lat {lat:.6f} lon {lon:.6f} {self._format_altitude_text(alt)}"
             )
         if self.current_status:
             parts.append(f"System status: {self.current_status}")
@@ -822,6 +925,7 @@ class CatchLeader(mp_module.MPModule):
         return self._map_icon_image
 
     def _update_map_target(self, target: Tuple[float, float, float], closing_time: Optional[float], manual: bool) -> None:
+        self._last_target_info = (target, manual, closing_time)
         mpmap = self._map_instance()
         if not mpmap:
             return
@@ -836,7 +940,7 @@ class CatchLeader(mp_module.MPModule):
             label_parts.append("predictive")
         if closing_time is not None:
             label_parts.append(f"ETA {closing_time:0.1f}s")
-        label_parts.append(f"alt {alt:.1f}m")
+        label_parts.append(self._format_altitude_text(alt))
         label = " | ".join(label_parts)
         colour = (255, 255, 0) if manual else (255, 128, 0)
         latlon = (lat, lon)
@@ -865,13 +969,16 @@ class CatchLeader(mp_module.MPModule):
 
     def _clear_map_target(self) -> None:
         if not self._map_target_added:
+            self._last_target_info = None
             return
         mpmap = self._map_instance()
         if not mpmap:
             self._map_target_added = False
+            self._last_target_info = None
             return
         mpmap.add_object(mp_slipmap.SlipRemoveObject(self._map_target_key))
         self._map_target_added = False
+        self._last_target_info = None
 
 
 def init(mpstate):
