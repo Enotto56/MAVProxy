@@ -68,6 +68,18 @@ class VehicleState:
         return math.hypot(self.vx, self.vy)
 
 
+@dataclass
+class SpeedSelection:
+    """Description of the currently requested follower speed profile."""
+
+    profile: str
+    value: float
+    source: str
+    forced_velocity: bool
+    fallback: bool = False
+    warning: Optional[str] = None
+
+
 class NullCatchLeaderUI:
     """Fallback UI if wx is not available."""
 
@@ -333,6 +345,12 @@ class CatchLeader(mp_module.MPModule):
             ("follower_sysid", int, 2),
             ("follower_compid", int, 1),
             ("follower_speed", float, 20.0),
+            mp_settings.MPSetting(
+                "speed_profile",
+                str,
+                "custom",
+                choice=["cruise", "max", "custom"],
+            ),
             ("max_lookahead", float, 25.0),
             ("min_closing", float, 1.0),
             ("update_period", float, 0.5),
@@ -382,11 +400,17 @@ class CatchLeader(mp_module.MPModule):
         self._last_leader_label: Optional[str] = None
         self._last_follower_label: Optional[str] = None
         self._last_target_info: Optional[Tuple[Tuple[float, float, float], bool, Optional[float]]] = None
+        self._last_speed_selection: Optional[SpeedSelection] = None
+        self._last_speed_command_value: Optional[float] = None
+        self._last_speed_profile_command: Optional[str] = None
+        self._last_speed_source_command: Optional[str] = None
+        self._velocity_override_warning_sent = False
 
         self.ui = self._create_ui()
         self._emit_vehicle_options()
         self._emit_status()
         self._emit_altitude_mode(initial=True)
+        self._update_speed_selection(log_change=True)
 
     def _create_ui(self):
         if wx is None:
@@ -425,6 +449,159 @@ class CatchLeader(mp_module.MPModule):
         if not initial:
             self._refresh_target_display()
 
+    def _resolve_speed_selection(self) -> SpeedSelection:
+        profile = getattr(self.catch_settings, "speed_profile", "custom") or "custom"
+        profile = profile.lower()
+        if profile not in {"custom", "cruise", "max"}:
+            profile = "custom"
+        forced_velocity = profile == "max"
+        follower_speed = float(self.catch_settings.follower_speed)
+        value = max(follower_speed, 0.0)
+        source = "follower_speed"
+        fallback = False
+        warning: Optional[str] = None
+
+        profile_candidates = {
+            "cruise": [
+                ("AIRSPEED_CRUISE", 1.0),
+                ("AIRSPEED_TRIM", 1.0),
+                ("TRIM_ARSPD_CM", 0.01),
+            ],
+            "max": [
+                ("AIRSPEED_MAX", 1.0),
+                ("ARSPD_FBW_MAX", 0.01),
+            ],
+        }
+
+        candidates = profile_candidates.get(profile, [])
+        if candidates:
+            candidate_value = None
+            candidate_source = None
+            for name, scale in candidates:
+                param_value = self.get_mav_param(name, None)
+                if param_value is None:
+                    continue
+                try:
+                    scaled = float(param_value) * scale
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(scaled) or scaled <= 0.0:
+                    continue
+                candidate_value = scaled
+                candidate_source = name
+                break
+            if candidate_value is not None:
+                value = candidate_value
+                source = candidate_source or source
+            else:
+                fallback = True
+                wanted = ", ".join(name for name, _scale in candidates)
+                warning = (f"{profile} profile parameters unavailable; "
+                           f"using follower_speed ({value:.1f} m/s) instead. "
+                           f"Checked {wanted}.")
+
+        if value <= 0.0:
+            zero_warning = ("Follower speed is non-positive; intercept guidance will "
+                            "use a minimum of 0.1 m/s until updated.")
+            warning = f"{warning} {zero_warning}" if warning else zero_warning
+
+        return SpeedSelection(
+            profile=profile,
+            value=value,
+            source=source,
+            forced_velocity=forced_velocity,
+            fallback=fallback,
+            warning=warning,
+        )
+
+    @staticmethod
+    def _speed_selection_changed(previous: Optional[SpeedSelection], current: SpeedSelection) -> bool:
+        if previous is None:
+            return True
+        if previous.profile != current.profile:
+            return True
+        if previous.source != current.source:
+            return True
+        if previous.forced_velocity != current.forced_velocity:
+            return True
+        if previous.fallback != current.fallback:
+            return True
+        if abs(previous.value - current.value) > 0.1:
+            return True
+        return False
+
+    def _format_speed_selection(self, selection: SpeedSelection) -> str:
+        desc = f"{selection.profile} {selection.value:.1f} m/s"
+        if selection.source == "follower_speed":
+            desc += " (follower_speed)"
+        else:
+            desc += f" via {selection.source}"
+        if selection.fallback:
+            desc += " [fallback]"
+        if selection.forced_velocity:
+            desc += " [velocity override]"
+        return desc
+
+    def _update_speed_selection(self, log_change: bool = False) -> SpeedSelection:
+        selection = self._resolve_speed_selection()
+        previous = self._last_speed_selection
+        changed = self._speed_selection_changed(previous, selection)
+        self._last_speed_selection = selection
+        if log_change and changed:
+            message = f"Speed profile set to {self._format_speed_selection(selection)}"
+            if selection.warning:
+                message += f". {selection.warning}"
+            self.ui.post_update("log", message)
+        if selection.warning:
+            if not previous or previous.warning != selection.warning:
+                self.ui.post_update("log", f"Speed profile warning: {selection.warning}")
+        elif previous and previous.warning:
+            self.ui.post_update("log", "Speed profile warning cleared")
+        if changed:
+            self._last_speed_command_value = None
+            self._last_speed_profile_command = None
+            self._last_speed_source_command = None
+        return selection
+
+    def _maybe_send_speed_command(self, selection: SpeedSelection) -> None:
+        if self.guidance_state != "auto":
+            return
+        if selection.value <= 0.0:
+            return
+        if (self._last_speed_command_value is not None
+                and abs(self._last_speed_command_value - selection.value) < 0.25
+                and self._last_speed_profile_command == selection.profile
+                and self._last_speed_source_command == selection.source):
+            return
+
+        def sender(mav):
+            mav.command_long_send(
+                self.catch_settings.follower_sysid,
+                self.catch_settings.follower_compid,
+                mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+                0,
+                0,
+                float(selection.value),
+                -1,
+                0,
+                0,
+                0,
+                0,
+            )
+
+        self.mpstate.foreach_mav(
+            self.catch_settings.follower_sysid,
+            self.catch_settings.follower_compid,
+            sender,
+        )
+        log_message = f"Requested {self._format_speed_selection(selection)}"
+        if selection.warning:
+            log_message += f" — {selection.warning}"
+        self.ui.post_update("log", log_message)
+        self._last_speed_command_value = selection.value
+        self._last_speed_profile_command = selection.profile
+        self._last_speed_source_command = selection.source
+
     def cmd_catchleader(self, args: List[str]) -> None:
         if not args:
             self._print_usage()
@@ -435,9 +612,12 @@ class CatchLeader(mp_module.MPModule):
         elif cmd == "set":
             previous_mode = self.catch_settings.use_relative_alt
             self.catch_settings.command(args[1:])
+            self._update_speed_selection(log_change=True)
             self._refresh_sysids()
             changed = previous_mode != self.catch_settings.use_relative_alt
             self._on_altitude_mode_updated(changed, source="CLI set")
+            if len(args) == 1 or (len(args) >= 2 and args[1].lower() == "speed_profile"):
+                self._print_set_documentation()
         elif cmd in ("catch", "resume"):
             self.set_guidance_state("auto")
         elif cmd == "hold":
@@ -460,6 +640,14 @@ class CatchLeader(mp_module.MPModule):
 
     def _print_usage(self) -> None:
         print("Usage: catchleader <status|set|alt_mode|catch|hold|resume|fbwa|goto|clear>")
+
+    def _print_set_documentation(self) -> None:
+        print("catchleader set usage notes:")
+        print("  follower_speed <m/s>  - manual airspeed used with the custom profile (default)")
+        print("  speed_profile <cruise|max|custom>  - choose how follower speed is selected")
+        print("    cruise: use AIRSPEED_CRUISE/AIRSPEED_TRIM/TRIM_ARSPD_CM when available")
+        print("    max:    use AIRSPEED_MAX/ARSPD_FBW_MAX and engage velocity override")
+        print("    custom: rely on follower_speed without automatic parameter lookup")
 
     def _refresh_sysids(self) -> None:
         self.leader = self._ensure_state(
@@ -484,8 +672,12 @@ class CatchLeader(mp_module.MPModule):
         if state == "hold":
             self._set_system_status("Guidance paused by operator")
             self._clear_map_target()
+            self._last_speed_command_value = None
+            self._last_speed_profile_command = None
+            self._last_speed_source_command = None
         else:
             self._set_system_status("Awaiting intercept solution")
+            self._update_speed_selection(log_change=True)
 
     def _handle_manual_target(self, params: List[str]) -> None:
         if len(params) < 2:
@@ -553,18 +745,20 @@ class CatchLeader(mp_module.MPModule):
         if now - self.last_sent < self.catch_settings.update_period:
             return
 
+        speed_selection = self._update_speed_selection(log_change=False)
         if self.manual_target is not None:
             target = self.manual_target
             closing_time: Optional[float] = None
             self._set_system_status("Guiding to manual target")
         else:
-            intercept = self.compute_intercept(now)
+            intercept = self.compute_intercept(now, speed_selection)
             if intercept is None:
                 self._clear_map_target()
                 return
             target, closing_time = intercept
 
-        self._send_target(target)
+        self._maybe_send_speed_command(speed_selection)
+        self._send_target(target, speed_selection)
         self.last_sent = now
         self.ui.post_update(
             "status",
@@ -680,7 +874,11 @@ class CatchLeader(mp_module.MPModule):
             self.ui.post_update("log", log_text)
             self.last_warning = text
 
-    def compute_intercept(self, now: float) -> Optional[Tuple[Tuple[float, float, float], float]]:
+    def compute_intercept(
+        self,
+        now: float,
+        speed_selection: SpeedSelection,
+    ) -> Optional[Tuple[Tuple[float, float, float], float]]:
         if not self.leader.is_heartbeat_fresh(now, self.catch_settings.heartbeat_timeout):
             self._set_system_status("Waiting for leader heartbeat")
             return None
@@ -703,7 +901,7 @@ class CatchLeader(mp_module.MPModule):
             self._set_system_status(f"Follower mode {self.follower.mode} — waiting for GUIDED/LOITER")
             return None
 
-        follower_speed = max(self.catch_settings.follower_speed, 0.1)
+        follower_speed = max(speed_selection.value, 0.1)
         rng = mp_util.gps_distance(self.follower.lat, self.follower.lon,
                                    self.leader.lat, self.leader.lon)
         if rng < self.catch_settings.min_distance:
@@ -737,21 +935,59 @@ class CatchLeader(mp_module.MPModule):
         self._set_system_status(f"Intercepting leader — ETA {time_to_go:4.1f}s")
         return (predicted_lat, predicted_lon, target_alt), time_to_go
 
-    def _send_target(self, target: Tuple[float, float, float]) -> None:
+    def _send_target(self, target: Tuple[float, float, float], speed_selection: SpeedSelection) -> None:
         lat, lon, alt = target
         frame = (mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT
                  if self.catch_settings.use_relative_alt
                  else mavutil.mavlink.MAV_FRAME_GLOBAL_INT)
         type_mask = (
-            mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE
-            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE
-            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE
-            | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
+            mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
             | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
             | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
             | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
             | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE
         )
+
+        velocity_valid = False
+        vx = vy = vz = 0.0
+        if speed_selection.forced_velocity and speed_selection.value > 0.0:
+            follower_lat = self.follower.lat
+            follower_lon = self.follower.lon
+            if self.catch_settings.use_relative_alt:
+                follower_alt = self.follower.rel_alt
+            else:
+                follower_alt = self.follower.amsl_alt
+            if (follower_lat is not None and follower_lon is not None
+                    and follower_alt is not None):
+                bearing = mp_util.gps_bearing(follower_lat, follower_lon, lat, lon)
+                horizontal_distance = mp_util.gps_distance(follower_lat, follower_lon, lat, lon)
+                alt_error = alt - follower_alt
+                distance_3d = math.hypot(horizontal_distance, alt_error)
+                if distance_3d > 1e-3:
+                    horizontal_ratio = horizontal_distance / distance_3d if distance_3d > 0.0 else 0.0
+                    vx = speed_selection.value * horizontal_ratio * math.cos(math.radians(bearing))
+                    vy = speed_selection.value * horizontal_ratio * math.sin(math.radians(bearing))
+                    vz = speed_selection.value * (-alt_error / distance_3d)
+                    velocity_valid = True
+
+        if not velocity_valid:
+            type_mask |= (
+                mavutil.mavlink.POSITION_TARGET_TYPEMASK_VX_IGNORE
+                | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VY_IGNORE
+                | mavutil.mavlink.POSITION_TARGET_TYPEMASK_VZ_IGNORE
+            )
+
+        if speed_selection.forced_velocity and not velocity_valid:
+            if not self._velocity_override_warning_sent:
+                self.ui.post_update(
+                    "log",
+                    "Velocity override skipped — follower telemetry incomplete",
+                )
+                self._velocity_override_warning_sent = True
+        else:
+            if self._velocity_override_warning_sent and velocity_valid:
+                self.ui.post_update("log", "Velocity override restored")
+            self._velocity_override_warning_sent = False
 
         def sender(mav):
             timestamp = int((time.time() * 1000.0) % 0xFFFFFFFF)
@@ -764,9 +1000,9 @@ class CatchLeader(mp_module.MPModule):
                 int(lat * 1.0e7),
                 int(lon * 1.0e7),
                 alt,
-                0.0,
-                0.0,
-                0.0,
+                vx,
+                vy,
+                vz,
                 0.0,
                 0.0,
                 0.0,
@@ -781,7 +1017,11 @@ class CatchLeader(mp_module.MPModule):
         )
         self.ui.post_update(
             "log",
-            f"Sent intercept target {lat:.6f} {lon:.6f} {self._format_altitude_text(alt)}",
+            (
+                f"Sent intercept target {lat:.6f} {lon:.6f} {self._format_altitude_text(alt)}"
+                f" | speed {self._format_speed_selection(speed_selection)}"
+                + (" (velocity override active)" if velocity_valid else "")
+            ),
         )
 
     def _refresh_vehicle_labels(self, now: float, update_selection: bool = False) -> None:
@@ -863,6 +1103,8 @@ class CatchLeader(mp_module.MPModule):
             f"Follower: {self._format_vehicle(self.follower, now)}",
             f"Guidance state: {self.guidance_state.upper()}",
         ]
+        selection = self._last_speed_selection or self._update_speed_selection(log_change=False)
+        parts.append(f"Speed target: {self._format_speed_selection(selection)}")
         if self.manual_target is not None:
             lat, lon, alt = self.manual_target
             parts.append(
