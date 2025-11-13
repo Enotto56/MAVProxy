@@ -1358,6 +1358,7 @@ if __name__ == '__main__':
     if platform.system() == 'Windows':
         parser.add_option("--no-console", action='store_true', help="don't use GUI console")
     parser.add_option("--map", action='store_true', help="load map module")
+    parser.add_option("--catch", action='store_true', help="load catchleader module")
     parser.add_option(
         '--load-module',
         action='append',
@@ -1566,6 +1567,8 @@ if __name__ == '__main__':
 
     if opts.map:
         process_stdin('module load map')
+    if opts.catch:
+        process_stdin('module load catchleader')
 
     if (mpstate.settings.state_basedir is not None and
             opts.aircraft is not None):
