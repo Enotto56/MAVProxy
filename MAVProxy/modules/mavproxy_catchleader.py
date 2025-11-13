@@ -188,6 +188,26 @@ if wx is not None:
             btn_clear = wx.Button(panel, label="Clear manual target")
             btn_fbwa = wx.Button(panel, label="Follower to FBWA")
 
+            speed_profile_choices = ["Cruise", "Max", "Custom"]
+            speed_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            self._suppress_speed_profile_event = False
+            self.speed_profile_choice = wx.Choice(panel, choices=speed_profile_choices)
+            self.speed_profile_choice.Bind(wx.EVT_CHOICE, self._on_speed_profile_choice)
+            self.custom_speed_input = wx.TextCtrl(panel, style=wx.TE_PROCESS_ENTER)
+            self.custom_speed_input.Bind(wx.EVT_TEXT_ENTER, self._on_custom_speed_enter)
+            self.custom_speed_button = wx.Button(panel, label="Set custom speed")
+            self.custom_speed_button.Bind(wx.EVT_BUTTON, self._on_custom_speed_button)
+            speed_sizer.Add(wx.StaticText(panel, label="Speed profile:"),
+                            flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=4)
+            speed_sizer.Add(self.speed_profile_choice, flag=wx.RIGHT, border=8)
+            speed_sizer.Add(wx.StaticText(panel, label="Custom speed (m/s):"),
+                            flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, border=4)
+            speed_sizer.Add(self.custom_speed_input, proportion=1, flag=wx.RIGHT, border=4)
+            speed_sizer.Add(self.custom_speed_button)
+            self._update_speed_controls_enabled("unknown")
+
+            self.speed_status_text = wx.StaticText(panel, label="Speed profile: ---")
+
             btn_catch.Bind(wx.EVT_BUTTON,
                            lambda evt: self.ui_state.child_pipe.send(("command", "catch")))
             btn_hold.Bind(wx.EVT_BUTTON,
@@ -217,6 +237,8 @@ if wx is not None:
                 main_sizer.Add(widget, flag=wx.ALL | wx.EXPAND, border=4)
 
             main_sizer.Add(self.alt_mode_toggle, flag=wx.ALL | wx.ALIGN_CENTER_HORIZONTAL, border=4)
+            main_sizer.Add(speed_sizer, flag=wx.ALL | wx.EXPAND, border=4)
+            main_sizer.Add(self.speed_status_text, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, border=4)
 
             button_sizer = wx.BoxSizer(wx.HORIZONTAL)
             for button in (btn_catch, btn_hold, btn_resume, btn_clear, btn_fbwa):
@@ -237,6 +259,32 @@ if wx is not None:
             self.alt_mode_toggle.SetLabel(f"Altitude mode: {'Relative' if mode == 'relative' else 'Absolute'}")
             try:
                 self.ui_state.child_pipe.send(("command", f"alt_mode:{mode}"))
+            except (EOFError, BrokenPipeError):
+                pass
+
+        def _on_speed_profile_choice(self, _event) -> None:
+            if self._suppress_speed_profile_event:
+                return
+            selection = self.speed_profile_choice.GetStringSelection().lower()
+            if not selection:
+                return
+            try:
+                self.ui_state.child_pipe.send(("command", f"speed_profile:{selection}"))
+            except (EOFError, BrokenPipeError):
+                pass
+
+        def _on_custom_speed_enter(self, _event) -> None:
+            self._send_custom_speed_command()
+
+        def _on_custom_speed_button(self, _event) -> None:
+            self._send_custom_speed_command()
+
+        def _send_custom_speed_command(self) -> None:
+            value = self.custom_speed_input.GetValue().strip()
+            if not value:
+                return
+            try:
+                self.ui_state.child_pipe.send(("command", f"custom_speed:{value}"))
             except (EOFError, BrokenPipeError):
                 pass
 
@@ -295,6 +343,12 @@ if wx is not None:
                         self._set_choice_selection(self.follower_choice, payload)
                     elif name == "alt_mode" and payload in ("relative", "absolute"):
                         self._update_alt_mode_toggle(payload)
+                    elif name == "speed_profile" and payload is not None:
+                        self._set_speed_profile(payload)
+                    elif name == "custom_speed" and payload is not None:
+                        self._set_custom_speed(payload)
+                    elif name == "speed_status" and payload is not None:
+                        self.speed_status_text.SetLabel(payload)
                     elif name == "shutdown":
                         self.Destroy()
                         return
@@ -319,6 +373,30 @@ if wx is not None:
             idx = choice.FindString(value)
             if idx != wx.NOT_FOUND:
                 choice.SetSelection(idx)
+
+        def _set_speed_profile(self, profile: str) -> None:
+            label_map = {"cruise": "Cruise", "max": "Max", "custom": "Custom"}
+            display = label_map.get(profile.lower())
+            self._suppress_speed_profile_event = True
+            try:
+                if display is None:
+                    self.speed_profile_choice.SetSelection(wx.NOT_FOUND)
+                else:
+                    idx = self.speed_profile_choice.FindString(display)
+                    if idx != wx.NOT_FOUND:
+                        self.speed_profile_choice.SetSelection(idx)
+                self._update_speed_controls_enabled(profile.lower())
+            finally:
+                self._suppress_speed_profile_event = False
+
+        def _set_custom_speed(self, value: str) -> None:
+            if self.custom_speed_input.GetValue() != value:
+                self.custom_speed_input.SetValue(value)
+
+        def _update_speed_controls_enabled(self, profile: str) -> None:
+            enable_custom = profile == "custom"
+            self.custom_speed_input.Enable(enable_custom)
+            self.custom_speed_button.Enable(enable_custom)
 
         def _update_alt_mode_toggle(self, mode: str) -> None:
             is_relative = mode == "relative"
@@ -543,6 +621,19 @@ class CatchLeader(mp_module.MPModule):
             desc += " [velocity override]"
         return desc
 
+    def _emit_speed_selection(self, selection: SpeedSelection) -> None:
+        status = f"Speed profile: {self._format_speed_selection(selection)}"
+        if selection.warning:
+            status += f" — {selection.warning}"
+        follower_speed = self.catch_settings.follower_speed
+        try:
+            follower_display = float(follower_speed)
+        except (TypeError, ValueError):
+            follower_display = 0.0
+        self.ui.post_update("speed_status", status)
+        self.ui.post_update("speed_profile", selection.profile)
+        self.ui.post_update("custom_speed", f"{max(follower_display, 0.0):.1f}")
+
     def _update_speed_selection(self, log_change: bool = False) -> SpeedSelection:
         selection = self._resolve_speed_selection()
         previous = self._last_speed_selection
@@ -562,6 +653,7 @@ class CatchLeader(mp_module.MPModule):
             self._last_speed_command_value = None
             self._last_speed_profile_command = None
             self._last_speed_source_command = None
+        self._emit_speed_selection(selection)
         return selection
 
     def _maybe_send_speed_command(self, selection: SpeedSelection) -> None:
@@ -834,6 +926,10 @@ class CatchLeader(mp_module.MPModule):
                 self._handle_ui_selection(payload[len("select_follower:"):], leader=False)
             elif payload and payload.startswith("alt_mode:"):
                 self._handle_altitude_mode(payload[len("alt_mode:"):], source="UI")
+            elif payload and payload.startswith("speed_profile:"):
+                self._handle_ui_speed_profile(payload[len("speed_profile:"):])
+            elif payload and payload.startswith("custom_speed:"):
+                self._handle_ui_custom_speed(payload[len("custom_speed:"):])
             elif payload == "ui_closed":
                 self.ui.close()
                 self.ui = NullCatchLeaderUI()
@@ -854,6 +950,30 @@ class CatchLeader(mp_module.MPModule):
         self._refresh_sysids()
         who = "Leader" if leader else "Follower"
         self.ui.post_update("log", f"{who} set to {sysid}:{compid}")
+
+    def _handle_ui_speed_profile(self, profile: str) -> None:
+        desired = profile.strip().lower()
+        if desired not in ("custom", "cruise", "max"):
+            self.ui.post_update("log", f"Unknown speed profile '{profile}' from UI")
+            return
+        self.catch_settings.set("speed_profile", desired)
+        self._update_speed_selection(log_change=True)
+
+    def _handle_ui_custom_speed(self, value: str) -> None:
+        text = value.strip()
+        if not text:
+            return
+        try:
+            follower_speed = float(text)
+        except ValueError:
+            self.ui.post_update("log", f"Invalid custom speed '{value}'")
+            return
+        if follower_speed <= 0:
+            self.ui.post_update("log", "Custom speed must be positive")
+            return
+        self.catch_settings.set("follower_speed", follower_speed)
+        self.ui.post_update("log", f"Custom follower speed set to {follower_speed:.1f} m/s")
+        self._update_speed_selection(log_change=True)
 
     def _handle_altitude_mode(self, mode: str, source: str = "command") -> None:
         desired = mode.strip().lower()

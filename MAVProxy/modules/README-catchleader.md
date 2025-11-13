@@ -28,6 +28,12 @@ catchleader speed <cruise|max|custom> [value]
   missing the module reverts to position-only guidance and reports this in the
   log.
 
+The graphical interface mirrors these controls: it now exposes a **Speed
+profile** drop-down with the same options plus a **Set custom speed** entry
+field and button. Selecting a profile or applying a custom value from the GUI
+updates the module immediately, avoiding the need to type console commands
+during operations.
+
 Whenever a profile resolves to a concrete speed the module issues
 `MAV_CMD_DO_CHANGE_SPEED` to the follower before pushing a new position target.
 This keeps the autopilot airspeed controller aligned with the requested
