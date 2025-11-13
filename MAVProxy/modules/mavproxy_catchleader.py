@@ -484,6 +484,8 @@ class CatchLeader(mp_module.MPModule):
         self._last_speed_profile_command: Optional[str] = None
         self._last_speed_source_command: Optional[str] = None
         self._velocity_override_warning_sent = False
+        self._follower_speed_smoothed: Optional[float] = None
+        self._speed_telemetry_warning_sent = False
 
         self.ui = self._create_ui()
         self._emit_vehicle_options()
@@ -781,6 +783,9 @@ class CatchLeader(mp_module.MPModule):
         print("    cruise: use AIRSPEED_CRUISE/AIRSPEED_TRIM/TRIM_ARSPD_CM when available")
         print("    max:    use AIRSPEED_MAX/ARSPD_FBW_MAX and engage velocity override")
         print("    custom: rely on follower_speed without automatic parameter lookup")
+        print("  min_closing <m/s>     - minimum closing rate enforced during intercept")
+        print("The guidance logic prefers measured follower groundspeed; if telemetry is")
+        print("missing it falls back to follower_speed and records a warning in the log.")
 
     def _handle_speed_command(self, params: List[str]) -> None:
         usage = "Usage: catchleader speed <cruise|max|custom> [value]"
@@ -1089,7 +1094,36 @@ class CatchLeader(mp_module.MPModule):
             self._set_system_status(f"Follower mode {self.follower.mode} — waiting for GUIDED/LOITER")
             return None
 
-        follower_speed = max(speed_selection.value, 0.1)
+        actual_speed = self.follower.speed()
+        follower_speed_source = "telemetry"
+        if actual_speed is not None and math.isfinite(actual_speed):
+            alpha = 0.35
+            if self._follower_speed_smoothed is None:
+                self._follower_speed_smoothed = actual_speed
+            else:
+                self._follower_speed_smoothed = (
+                    alpha * actual_speed
+                    + (1.0 - alpha) * self._follower_speed_smoothed
+                )
+            follower_speed = max(self._follower_speed_smoothed, 0.1)
+            if self._speed_telemetry_warning_sent:
+                self.ui.post_update(
+                    "log",
+                    "Follower speed telemetry restored; using measured groundspeed for intercept calculations.",
+                )
+                self._speed_telemetry_warning_sent = False
+        else:
+            follower_speed = max(speed_selection.value, 0.1)
+            follower_speed_source = "fallback"
+            if not self._speed_telemetry_warning_sent:
+                self.ui.post_update(
+                    "log",
+                    (
+                        "Follower speed telemetry unavailable — using configured "
+                        f"follower_speed ({follower_speed:.1f} m/s) as fallback."
+                    ),
+                )
+                self._speed_telemetry_warning_sent = True
         rng = mp_util.gps_distance(self.follower.lat, self.follower.lon,
                                    self.leader.lat, self.leader.lon)
         if rng < self.catch_settings.min_distance:
@@ -1104,9 +1138,14 @@ class CatchLeader(mp_module.MPModule):
         else:
             leader_course = bearing_to_leader
         closing_projection = leader_speed * math.cos(math.radians(bearing_to_leader - leader_course))
-        closing_rate = follower_speed - closing_projection
-        if closing_rate <= 0.01:
-            closing_rate = max(self.catch_settings.min_closing, 0.1)
+        closing_rate_raw = follower_speed - closing_projection
+        min_closing = max(self.catch_settings.min_closing, 0.1)
+        if closing_rate_raw < min_closing:
+            closing_rate = min_closing
+            closing_limited = True
+        else:
+            closing_rate = closing_rate_raw
+            closing_limited = False
         time_to_go = min(rng / closing_rate, self.catch_settings.max_lookahead)
         offset_distance = leader_speed * time_to_go
         predicted_lat, predicted_lon = mp_util.gps_newpos(
@@ -1120,7 +1159,18 @@ class CatchLeader(mp_module.MPModule):
         else:
             leader_alt = self.leader.amsl_alt if self.leader.amsl_alt is not None else 0.0
         target_alt = leader_alt + self.catch_settings.target_alt_offset
-        self._set_system_status(f"Intercepting leader — ETA {time_to_go:4.1f}s")
+        if follower_speed_source == "telemetry":
+            speed_note = "measured"
+        else:
+            speed_note = "fallback"
+        closing_text = f"{closing_rate:.1f} m/s"
+        if closing_limited:
+            closing_text += f" (min_closing {min_closing:.1f} m/s)"
+        status = (
+            f"Intercepting leader — ETA {time_to_go:4.1f}s "
+            f"(spd {follower_speed:.1f} m/s {speed_note}, closing {closing_text})"
+        )
+        self._set_system_status(status)
         return (predicted_lat, predicted_lon, target_alt), time_to_go
 
     def _send_target(self, target: Tuple[float, float, float], speed_selection: SpeedSelection) -> None:
