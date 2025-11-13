@@ -39,6 +39,17 @@ Whenever a profile resolves to a concrete speed the module issues
 This keeps the autopilot airspeed controller aligned with the requested
 profile.
 
+## Dynamic follower speed telemetry
+
+When solving the intercept the module now prefers the follower's measured
+groundspeed, smoothing the telemetry with an exponential filter to avoid abrupt
+changes. Should the speed estimate be unavailable the previous behaviour is
+retained: the configured `follower_speed` value is used instead. In that case a
+warning is recorded in the module log so that operators are aware that the
+intercept timing relies on a fallback value. The `min_closing` setting continues
+to guarantee progress towards the leader and is now reflected in the status
+message whenever it limits the solution.
+
 ## Backward compatibility
 
 Existing configurations continue to function without modification—the
