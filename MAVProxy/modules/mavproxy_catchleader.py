@@ -528,6 +528,44 @@ class CatchLeader(mp_module.MPModule):
         if not initial:
             self._refresh_target_display()
 
+    def _get_vehicle_param(self, sysid: Optional[int], compid: Optional[int],
+                           name: str, default=None):
+        """Lookup a parameter for a specific vehicle without changing selection."""
+
+        if sysid is None:
+            return default
+
+        name = name.upper()
+        candidates: List[Tuple[int, int]] = []
+        if compid is not None:
+            candidates.append((int(sysid), int(compid)))
+        # Common autopilot components to try as fallbacks
+        candidates.extend([
+            (int(sysid), 1),
+            (int(sysid), 0),
+        ])
+
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            params = self.mpstate.mav_param_by_sysid.get(candidate)
+            if not params:
+                continue
+            value = params.get(name, None)
+            if value is not None:
+                return value
+        return default
+
+    def _get_follower_param(self, name: str, default=None):
+        return self._get_vehicle_param(
+            getattr(self.catch_settings, "follower_sysid", None),
+            getattr(self.catch_settings, "follower_compid", None),
+            name,
+            default,
+        )
+
     def _resolve_speed_selection(self) -> SpeedSelection:
         profile = getattr(self.catch_settings, "speed_profile", "custom") or "custom"
         profile = profile.lower()
@@ -557,7 +595,7 @@ class CatchLeader(mp_module.MPModule):
             candidate_value = None
             candidate_source = None
             for name, scale in candidates:
-                param_value = self.get_mav_param(name, None)
+                param_value = self._get_follower_param(name, None)
                 if param_value is None:
                     continue
                 try:
