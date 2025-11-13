@@ -367,6 +367,7 @@ class CatchLeader(mp_module.MPModule):
             [
                 "status",
                 "set (CATCHSETTING)",
+                "speed <cruise|max|custom> [value]",
                 "alt_mode:<relative|absolute>",
                 "catch",
                 "hold",
@@ -618,6 +619,8 @@ class CatchLeader(mp_module.MPModule):
             self._on_altitude_mode_updated(changed, source="CLI set")
             if len(args) == 1 or (len(args) >= 2 and args[1].lower() == "speed_profile"):
                 self._print_set_documentation()
+        elif cmd == "speed":
+            self._handle_speed_command(args[1:])
         elif cmd in ("catch", "resume"):
             self.set_guidance_state("auto")
         elif cmd == "hold":
@@ -639,7 +642,7 @@ class CatchLeader(mp_module.MPModule):
             self._print_usage()
 
     def _print_usage(self) -> None:
-        print("Usage: catchleader <status|set|alt_mode|catch|hold|resume|fbwa|goto|clear>")
+        print("Usage: catchleader <status|set|speed|alt_mode|catch|hold|resume|fbwa|goto|clear>")
 
     def _print_set_documentation(self) -> None:
         print("catchleader set usage notes:")
@@ -648,6 +651,33 @@ class CatchLeader(mp_module.MPModule):
         print("    cruise: use AIRSPEED_CRUISE/AIRSPEED_TRIM/TRIM_ARSPD_CM when available")
         print("    max:    use AIRSPEED_MAX/ARSPD_FBW_MAX and engage velocity override")
         print("    custom: rely on follower_speed without automatic parameter lookup")
+
+    def _handle_speed_command(self, params: List[str]) -> None:
+        usage = "Usage: catchleader speed <cruise|max|custom> [value]"
+        if not params:
+            print(usage)
+            return
+        profile = params[0].lower()
+        if profile not in ("cruise", "max", "custom"):
+            print("Unknown speed profile. Expected cruise, max, or custom.")
+            print(usage)
+            return
+        if profile == "custom" and len(params) >= 2:
+            try:
+                follower_speed = float(params[1])
+            except ValueError:
+                print("Invalid custom speed value")
+                return
+            if follower_speed <= 0:
+                print("Custom speed must be positive")
+                return
+            self.catch_settings.set("follower_speed", follower_speed)
+            print(f"Custom follower speed set to {follower_speed:.1f} m/s")
+        elif profile != "custom" and len(params) >= 2:
+            print("Warning: numeric value ignored for non-custom profiles")
+        self.catch_settings.set("speed_profile", profile)
+        selection = self._update_speed_selection(log_change=True)
+        print(f"Speed profile set to {self._format_speed_selection(selection)}")
 
     def _refresh_sysids(self) -> None:
         self.leader = self._ensure_state(

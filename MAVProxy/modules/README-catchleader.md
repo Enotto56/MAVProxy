@@ -9,10 +9,12 @@ optionally drive the follower into FBWA for manual intervention.
 
 Use the `catchleader set` command to inspect or change module settings. In
 addition to the existing `follower_speed` value, the module now supports speed
-profiles:
+profiles. They can be adjusted either via the settings command or with the
+dedicated shortcut:
 
 ```
 catchleader set speed_profile <cruise|max|custom>
+catchleader speed <cruise|max|custom> [value]
 ```
 
 * **custom** – default behaviour that relies on the configured
