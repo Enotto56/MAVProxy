@@ -437,6 +437,7 @@ class CatchLeader(mp_module.MPModule):
             ("position_timeout", float, 3.0),
             ("heartbeat_timeout", float, 4.5),
             ("use_relative_alt", bool, False),
+            ("target_filter_alpha", float, 0.5),
         ])
         self.add_command(
             "catchleader",
@@ -486,12 +487,20 @@ class CatchLeader(mp_module.MPModule):
         self._velocity_override_warning_sent = False
         self._follower_speed_smoothed: Optional[float] = None
         self._speed_telemetry_warning_sent = False
+        self.filtered_target: Optional[Tuple[float, float, float]] = None
 
         self.ui = self._create_ui()
         self._emit_vehicle_options()
         self._emit_status()
         self._emit_altitude_mode(initial=True)
         self._update_speed_selection(log_change=True)
+        self.ui.post_update(
+            "log",
+            (
+                "Target smoothing active - set target_filter_alpha (0.0-1.0) "
+                "to adjust EMA strength"
+            ),
+        )
 
     def _create_ui(self):
         if wx is None:
@@ -744,11 +753,22 @@ class CatchLeader(mp_module.MPModule):
             print(self.status_report())
         elif cmd == "set":
             previous_mode = self.catch_settings.use_relative_alt
+            previous_alpha = self.catch_settings.target_filter_alpha
             self.catch_settings.command(args[1:])
             self._update_speed_selection(log_change=True)
             self._refresh_sysids()
             changed = previous_mode != self.catch_settings.use_relative_alt
             self._on_altitude_mode_updated(changed, source="CLI set")
+            if self.catch_settings.target_filter_alpha != previous_alpha:
+                alpha = max(0.0, min(1.0, self.catch_settings.target_filter_alpha))
+                self._reset_target_filter()
+                self.ui.post_update(
+                    "log",
+                    (
+                        f"Target filter alpha set to {alpha:.2f} - "
+                        "higher values follow the leader more aggressively"
+                    ),
+                )
             if len(args) == 1 or (len(args) >= 2 and args[1].lower() == "speed_profile"):
                 self._print_set_documentation()
         elif cmd == "speed":
@@ -768,6 +788,7 @@ class CatchLeader(mp_module.MPModule):
             self._clear_map_target()
             self._last_target_info = None
             self._set_system_status("Awaiting intercept solution")
+            self._reset_target_filter()
         elif cmd.startswith("alt_mode:"):
             self._handle_altitude_mode(cmd[len("alt_mode:"):], source="CLI command")
         else:
@@ -784,6 +805,7 @@ class CatchLeader(mp_module.MPModule):
         print("    max:    use AIRSPEED_MAX/ARSPD_FBW_MAX and engage velocity override")
         print("    custom: rely on follower_speed without automatic parameter lookup")
         print("  min_closing <m/s>     - minimum closing rate enforced during intercept")
+        print("  target_filter_alpha    - EMA gain (1.0 = raw target, lower = more smoothing)")
         print("The guidance logic prefers measured follower groundspeed; if telemetry is")
         print("missing it falls back to follower_speed and records a warning in the log.")
 
@@ -830,7 +852,10 @@ class CatchLeader(mp_module.MPModule):
     def set_guidance_state(self, state: str) -> None:
         if state not in ("auto", "hold"):
             return
+        previous_state = self.guidance_state
         self.guidance_state = state
+        if state != previous_state:
+            self._reset_target_filter()
         text = "Guidance: AUTO" if state == "auto" else "Guidance: HOLD"
         self.ui.post_update("status", text)
         self.ui.post_update("log", f"Guidance state changed to {state.upper()}")
@@ -863,6 +888,7 @@ class CatchLeader(mp_module.MPModule):
         target = (lat, lon, alt)
         self.manual_target = target
         self.set_guidance_state("auto")
+        self._reset_target_filter()
         self.ui.post_update("target", self._format_target_label(target, True))
         self.ui.post_update("log", "Manual intercept target set")
         self._set_system_status("Guiding to manual target")
@@ -919,9 +945,11 @@ class CatchLeader(mp_module.MPModule):
             intercept = self.compute_intercept(now, speed_selection)
             if intercept is None:
                 self._clear_map_target()
+                self._reset_target_filter()
                 return
             target, closing_time = intercept
 
+        target = self._filter_target(target)
         self._maybe_send_speed_command(speed_selection)
         self._send_target(target, speed_selection)
         self.last_sent = now
@@ -953,6 +981,7 @@ class CatchLeader(mp_module.MPModule):
                 self.set_guidance_state("auto")
                 self._last_target_info = None
                 self._clear_map_target()
+                self._reset_target_filter()
             elif payload == "hold":
                 self.set_guidance_state("hold")
             elif payload == "clear":
@@ -961,6 +990,7 @@ class CatchLeader(mp_module.MPModule):
                 self._set_system_status("Awaiting intercept solution")
                 self._clear_map_target()
                 self._last_target_info = None
+                self._reset_target_filter()
             elif payload == "fbwa":
                 self.set_follower_fbwa()
             elif payload and payload.startswith("select_leader:"):
@@ -1343,6 +1373,11 @@ class CatchLeader(mp_module.MPModule):
         ]
         selection = self._last_speed_selection or self._update_speed_selection(log_change=False)
         parts.append(f"Speed target: {self._format_speed_selection(selection)}")
+        alpha = max(0.0, min(1.0, self.catch_settings.target_filter_alpha))
+        parts.append(
+            "Target filter alpha: "
+            f"{alpha:.2f} (1.0 = raw target, lower = more smoothing)"
+        )
         if self.manual_target is not None:
             lat, lon, alt = self.manual_target
             parts.append(
@@ -1351,6 +1386,21 @@ class CatchLeader(mp_module.MPModule):
         if self.current_status:
             parts.append(f"System status: {self.current_status}")
         return "\n".join(parts)
+
+    def _reset_target_filter(self) -> None:
+        self.filtered_target = None
+
+    def _filter_target(self, target: Tuple[float, float, float]) -> Tuple[float, float, float]:
+        alpha = max(0.0, min(1.0, self.catch_settings.target_filter_alpha))
+        if self.filtered_target is None or alpha >= 1.0:
+            self.filtered_target = target
+            return target
+        prev_lat, prev_lon, prev_alt = self.filtered_target
+        lat = prev_lat + alpha * (target[0] - prev_lat)
+        lon = prev_lon + alpha * (target[1] - prev_lon)
+        alt = prev_alt + alpha * (target[2] - prev_alt)
+        self.filtered_target = (lat, lon, alt)
+        return self.filtered_target
 
     def _emit_vehicle_options(self) -> None:
         if not self.vehicle_states:
