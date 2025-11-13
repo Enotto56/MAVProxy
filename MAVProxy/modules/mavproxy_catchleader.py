@@ -182,6 +182,24 @@ if wx is not None:
                 self._on_alt_mode_toggle,
             )
 
+            target_filter_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            self._suppress_target_filter_event = False
+            self.target_filter_slider = wx.Slider(
+                panel,
+                minValue=0,
+                maxValue=100,
+                style=wx.SL_HORIZONTAL,
+            )
+            self.target_filter_slider.Bind(wx.EVT_SLIDER, self._on_target_filter_slider)
+            self.target_filter_value = wx.StaticText(panel, label="Target smoothing α: 0.50")
+            target_filter_sizer.Add(
+                wx.StaticText(panel, label="Target smoothing:"),
+                flag=wx.ALIGN_CENTER_VERTICAL | wx.RIGHT,
+                border=4,
+            )
+            target_filter_sizer.Add(self.target_filter_slider, proportion=1, flag=wx.RIGHT, border=8)
+            target_filter_sizer.Add(self.target_filter_value, flag=wx.ALIGN_CENTER_VERTICAL)
+
             btn_catch = wx.Button(panel, label="Catch now")
             btn_hold = wx.Button(panel, label="Hold guidance")
             btn_resume = wx.Button(panel, label="Resume auto")
@@ -238,6 +256,7 @@ if wx is not None:
 
             main_sizer.Add(self.alt_mode_toggle, flag=wx.ALL | wx.ALIGN_CENTER_HORIZONTAL, border=4)
             main_sizer.Add(speed_sizer, flag=wx.ALL | wx.EXPAND, border=4)
+            main_sizer.Add(target_filter_sizer, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, border=4)
             main_sizer.Add(self.speed_status_text, flag=wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.EXPAND, border=4)
 
             button_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -253,6 +272,8 @@ if wx is not None:
             self.Bind(wx.EVT_TIMER, self.on_timer, self.timer)
             self.timer.Start(200)
             self.Bind(wx.EVT_CLOSE, self.on_close)
+
+            self._set_target_filter_alpha(0.5)
 
         def _on_alt_mode_toggle(self, _event) -> None:
             mode = "relative" if self.alt_mode_toggle.GetValue() else "absolute"
@@ -285,6 +306,16 @@ if wx is not None:
                 return
             try:
                 self.ui_state.child_pipe.send(("command", f"custom_speed:{value}"))
+            except (EOFError, BrokenPipeError):
+                pass
+
+        def _on_target_filter_slider(self, _event) -> None:
+            if self._suppress_target_filter_event:
+                return
+            alpha = self.target_filter_slider.GetValue() / 100.0
+            self._update_target_filter_label(alpha)
+            try:
+                self.ui_state.child_pipe.send(("command", f"target_filter_alpha:{alpha:.3f}"))
             except (EOFError, BrokenPipeError):
                 pass
 
@@ -349,6 +380,11 @@ if wx is not None:
                         self._set_custom_speed(payload)
                     elif name == "speed_status" and payload is not None:
                         self.speed_status_text.SetLabel(payload)
+                    elif name == "target_filter_alpha" and payload is not None:
+                        try:
+                            self._set_target_filter_alpha(float(payload))
+                        except ValueError:
+                            pass
                     elif name == "shutdown":
                         self.Destroy()
                         return
@@ -403,6 +439,20 @@ if wx is not None:
             self.alt_mode_toggle.SetValue(is_relative)
             label = "Altitude mode: Relative" if is_relative else "Altitude mode: Absolute"
             self.alt_mode_toggle.SetLabel(label)
+
+        def _update_target_filter_label(self, alpha: float) -> None:
+            self.target_filter_value.SetLabel(f"Target smoothing α: {alpha:.2f}")
+
+        def _set_target_filter_alpha(self, alpha: float) -> None:
+            clamped = max(0.0, min(1.0, alpha))
+            slider_value = int(round(clamped * 100))
+            self._suppress_target_filter_event = True
+            try:
+                if self.target_filter_slider.GetValue() != slider_value:
+                    self.target_filter_slider.SetValue(slider_value)
+                self._update_target_filter_label(clamped)
+            finally:
+                self._suppress_target_filter_event = False
 
         def on_close(self, event) -> None:
             try:
@@ -501,6 +551,8 @@ class CatchLeader(mp_module.MPModule):
                 "to adjust EMA strength"
             ),
         )
+        alpha = max(0.0, min(1.0, self.catch_settings.target_filter_alpha))
+        self.ui.post_update("target_filter_alpha", f"{alpha:.4f}")
 
     def _create_ui(self):
         if wx is None:
@@ -769,6 +821,7 @@ class CatchLeader(mp_module.MPModule):
                         "higher values follow the leader more aggressively"
                     ),
                 )
+                self.ui.post_update("target_filter_alpha", f"{alpha:.4f}")
             if len(args) == 1 or (len(args) >= 2 and args[1].lower() == "speed_profile"):
                 self._print_set_documentation()
         elif cmd == "speed":
@@ -1003,6 +1056,8 @@ class CatchLeader(mp_module.MPModule):
                 self._handle_ui_speed_profile(payload[len("speed_profile:"):])
             elif payload and payload.startswith("custom_speed:"):
                 self._handle_ui_custom_speed(payload[len("custom_speed:"):])
+            elif payload and payload.startswith("target_filter_alpha:"):
+                self._handle_ui_target_filter_alpha(payload[len("target_filter_alpha:"):])
             elif payload == "ui_closed":
                 self.ui.close()
                 self.ui = NullCatchLeaderUI()
@@ -1047,6 +1102,31 @@ class CatchLeader(mp_module.MPModule):
         self.catch_settings.set("follower_speed", follower_speed)
         self.ui.post_update("log", f"Custom follower speed set to {follower_speed:.1f} m/s")
         self._update_speed_selection(log_change=True)
+
+    def _handle_ui_target_filter_alpha(self, value: str) -> None:
+        text = value.strip()
+        if not text:
+            return
+        try:
+            alpha = float(text)
+        except ValueError:
+            self.ui.post_update("log", f"Invalid target filter alpha '{value}'")
+            return
+        clamped = max(0.0, min(1.0, alpha))
+        previous = getattr(self.catch_settings, "target_filter_alpha", clamped)
+        if math.isclose(previous, clamped, abs_tol=5.0e-4):
+            self.ui.post_update("target_filter_alpha", f"{clamped:.4f}")
+            return
+        self.catch_settings.set("target_filter_alpha", clamped)
+        self._reset_target_filter()
+        self.ui.post_update(
+            "log",
+            (
+                f"Target filter alpha set to {clamped:.2f} via UI — "
+                "higher values follow the leader more aggressively"
+            ),
+        )
+        self.ui.post_update("target_filter_alpha", f"{clamped:.4f}")
 
     def _handle_altitude_mode(self, mode: str, source: str = "command") -> None:
         desired = mode.strip().lower()
